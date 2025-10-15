@@ -56,7 +56,7 @@ class AnalysisCore:
                 else:
                     saturation_mask |= current_saturation_mask
 
-                print(f" - 成功加载 '{os.path.basename(filename)}' (尺寸: {data.shape})")
+                print(f"  - 成功加载 '{os.path.basename(filename)}' (尺寸: {data.shape})")
                 interferograms.append(data)
             except Exception as e:
                 print(f"  - 错误: 加载 '{os.path.basename(filename)}' 失败。错误信息: {e}")
