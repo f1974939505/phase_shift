@@ -203,6 +203,36 @@ class ZernikeAnalysisCore:
 
         print("  - 背景已重建并已从原图中减去。")
 
+        # --- 4.1 计算 PV / RMS 等统计量 ---
+        def compute_stats(data: np.ndarray, mask: np.ndarray):
+            masked = np.where(mask, data, np.nan)
+            if not np.any(mask):
+                return None
+            vmax = float(np.nanmax(masked))
+            vmin = float(np.nanmin(masked))
+            pv = vmax - vmin
+            mean = float(np.nanmean(masked))
+            rms = float(np.sqrt(np.nanmean((masked - mean) ** 2)))
+            flat_max = int(np.nanargmax(masked))
+            flat_min = int(np.nanargmin(masked))
+            max_pos = tuple(np.unravel_index(flat_max, masked.shape))
+            min_pos = tuple(np.unravel_index(flat_min, masked.shape))
+            return {
+                "vmax": vmax,
+                "vmin": vmin,
+                "pv": pv,
+                "mean": mean,
+                "rms": rms,
+                "max_pos": max_pos,
+                "min_pos": min_pos,
+            }
+
+        metrics = {
+            "original": compute_stats(phase_original, valid_mask),
+            "background": compute_stats(phase_background, valid_mask),
+            "residual": compute_stats(phase_residual, valid_mask),
+        }
+
         # --- 5. 保存背景和表面误差文件 ---
         print("正在保存背景和表面误差数据...")
 
@@ -242,6 +272,11 @@ class ZernikeAnalysisCore:
             "background": phase_background,
             "residual": phase_residual,
             "selected_terms": selected_terms,
+            "metrics": metrics,
+            "valid_mask": valid_mask,
+            "coeffs": coeffs,
+            "n_terms_fit": n_terms_fit,
+            "output_dir": output_dir,
         }
 
 
@@ -253,8 +288,9 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title("泽尼克背景去除工具（标准 Noll 索引）")
-        self.root.geometry("1100x650")
-        self.root.minsize(800, 550)
+        # 软件默认尺寸：相对于原始 1000x600 放大为宽度*1.5、高度*2
+        self.root.geometry("1500x1200")
+        self.root.minsize(900, 700)
 
         self.analysis_core = ZernikeAnalysisCore()
 
@@ -266,12 +302,22 @@ class App:
 
         base_font_size = 10
         self.scaled_font_size = int(base_font_size * float(scaling_factor))
-        font_family = "Microsoft YaHei UI"
+        self.font_family = "Microsoft YaHei UI"
 
         style = ttk.Style(root)
-        style.configure(".", font=(font_family, self.scaled_font_size))
-        style.configure("TButton", font=(font_family, self.scaled_font_size), padding=5)
-        style.configure("TLabelframe.Label", font=(font_family, self.scaled_font_size, "bold"))
+        style.configure(".", font=(self.font_family, self.scaled_font_size))
+        style.configure("TButton", font=(self.font_family, self.scaled_font_size), padding=5)
+        style.configure("TLabelframe.Label", font=(self.font_family, self.scaled_font_size, "bold"))
+        # 为系数表单独设置 Treeview 的行高和字体，避免内容挤在一起
+        style.configure(
+            "Coeff.Treeview",
+            font=(self.font_family, max(self.scaled_font_size - 1, 8)),
+            rowheight=int(self.scaled_font_size * 2.2),
+        )
+        style.configure(
+            "Coeff.Treeview.Heading",
+            font=(self.font_family, self.scaled_font_size),
+        )
 
         main_frame = ttk.Frame(root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
@@ -283,7 +329,7 @@ class App:
         # 输入文件
         self.input_file = tk.StringVar()
         ttk.Label(options_frame, text="相位数据文件:").grid(row=0, column=0, padx=5, pady=8, sticky="w")
-        ttk.Entry(options_frame, textvariable=self.input_file, font=(font_family, self.scaled_font_size)).grid(
+        ttk.Entry(options_frame, textvariable=self.input_file, font=(self.font_family, self.scaled_font_size)).grid(
             row=0, column=1, padx=5, pady=5, sticky="ew"
         )
         ttk.Button(options_frame, text="浏览...", command=self.browse_input).grid(row=0, column=2, padx=5, pady=5)
@@ -293,7 +339,7 @@ class App:
         ttk.Label(options_frame, text="输出文件夹 (空则为默认):").grid(
             row=1, column=0, padx=5, pady=8, sticky="w"
         )
-        ttk.Entry(options_frame, textvariable=self.output_dir, font=(font_family, self.scaled_font_size)).grid(
+        ttk.Entry(options_frame, textvariable=self.output_dir, font=(self.font_family, self.scaled_font_size)).grid(
             row=1, column=1, padx=5, pady=5, sticky="ew"
         )
         ttk.Button(options_frame, text="浏览...", command=self.browse_output).grid(row=1, column=2, padx=5, pady=5)
@@ -307,7 +353,7 @@ class App:
         ttk.Entry(
             param_run_frame,
             textvariable=self.fit_terms,
-            font=(font_family, self.scaled_font_size),
+            font=(self.font_family, self.scaled_font_size),
             width=8,
         ).pack(side=tk.LEFT)
 
@@ -352,6 +398,9 @@ class App:
                 variable=var,
             ).pack(anchor="w")
 
+        # 名称映射，供系数表使用
+        self.term_name_map = {k: name for (k, name, n, m, desc) in self.term_info}
+
         # --- 日志框架 ---
         log_frame = ttk.LabelFrame(main_frame, text="日志输出", padding="10")
         log_frame.pack(side=tk.BOTTOM, fill=tk.X, expand=False, pady=5)
@@ -360,21 +409,9 @@ class App:
             height=10,
             wrap=tk.WORD,
             state="disabled",
-            font=(font_family, self.scaled_font_size - 1),
+            font=(self.font_family, self.scaled_font_size - 1),
         )
         self.log_text.pack(fill=tk.BOTH, expand=True)
-
-        # --- 结果提示框架 ---
-        plot_frame = ttk.LabelFrame(main_frame, text="结果图表", padding="10")
-        plot_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=5)
-        message_font = (font_family, self.scaled_font_size + 2)
-        ttk.Label(
-            plot_frame,
-            text="分析完成后，图表将在此处弹出一个新窗口。",
-            font=message_font,
-            anchor="center",
-            justify="center",
-        ).pack(fill=tk.BOTH, expand=True)
 
         # 将 stdout 重定向到日志窗口
         sys.stdout = self.RedirectText(self.log_text)
@@ -441,14 +478,16 @@ class App:
                 input_file, output_dir, n_terms_fit=n_fit, selected_terms=selected_terms
             )
             if results:
+                # 在主线程中更新 UI：显示图和系数表
                 self.root.after(0, self.show_plot_in_new_window, results)
+                self.root.after(0, self.show_zernike_table_window, results)
         except Exception as e:
             print(f"分析过程中发生严重错误: {e}")
         finally:
             self.root.after(0, lambda: self.run_button.config(state="normal"))
 
     # ---------------------------
-    #  绘图
+    #  绘图（独立弹窗）
     # ---------------------------
     def show_plot_in_new_window(self, plot_data):
         try:
@@ -459,6 +498,7 @@ class App:
             plot_window.geometry("1400x700")
 
             selected_terms = plot_data.get("selected_terms", [])
+            metrics = plot_data.get("metrics", {}) or {}
 
             fig = Figure(figsize=(18, 6), dpi=100)
             if selected_terms:
@@ -470,29 +510,127 @@ class App:
             axes = fig.subplots(1, 3)
             font_props = {"fontsize": self.scaled_font_size + 4}
 
-            vmax = np.nanmax(plot_data["original"])
-            vmin = np.nanmin(plot_data["original"])
+            original = plot_data["original"]
+            background = plot_data["background"]
+            residual = plot_data["residual"]
 
-            im1 = axes[0].imshow(plot_data["original"], cmap="viridis", vmin=vmin, vmax=vmax)
-            axes[0].set_title("原始展开相位", **font_props)
+            vmax = np.nanmax(original)
+            vmin = np.nanmin(original)
+
+            # 原始相位
+            im1 = axes[0].imshow(original, cmap="viridis", vmin=vmin, vmax=vmax)
+            m0 = metrics.get("original")
+            if m0 is not None:
+                title0 = f"原始展开相位 (RMS = {m0['rms']:.4f} rad)"
+            else:
+                title0 = "原始展开相位"
+            axes[0].set_title(title0, **font_props)
             fig.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04, label="相位 (rad)")
 
-            im2 = axes[1].imshow(plot_data["background"], cmap="viridis", vmin=vmin, vmax=vmax)
-            if selected_terms:
-                axes[1].set_title(f"拟合的背景 (共 {len(selected_terms)} 项)", **font_props)
+            # 拟合背景
+            im2 = axes[1].imshow(background, cmap="viridis", vmin=vmin, vmax=vmax)
+            m1 = metrics.get("background")
+            if m1 is not None:
+                if selected_terms:
+                    title1 = f"拟合的背景 (共 {len(selected_terms)} 项, RMS = {m1['rms']:.4f} rad)"
+                else:
+                    title1 = f"拟合的背景 (未选择任何项，背景=0, RMS = {m1['rms']:.4f} rad)"
             else:
-                axes[1].set_title("拟合的背景 (未选择任何项，背景=0)", **font_props)
+                if selected_terms:
+                    title1 = f"拟合的背景 (共 {len(selected_terms)} 项)"
+                else:
+                    title1 = "拟合的背景 (未选择任何项，背景=0)"
+            axes[1].set_title(title1, **font_props)
             fig.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04, label="相位 (rad)")
 
-            res_vmax = np.nanmax(np.abs(plot_data["residual"]))
+            # 残差
+            res_vmax = np.nanmax(np.abs(residual))
             im3 = axes[2].imshow(
-                plot_data["residual"],
+                residual,
                 cmap="coolwarm",
                 vmin=-res_vmax,
                 vmax=res_vmax,
             )
-            axes[2].set_title("器件表面误差 (残差)", **font_props)
+            m2 = metrics.get("residual")
+            if m2 is not None:
+                title2 = f"器件表面误差 (残差, RMS = {m2['rms']:.4f} rad)"
+            else:
+                title2 = "器件表面误差 (残差)"
+            axes[2].set_title(title2, **font_props)
             fig.colorbar(im3, ax=axes[2], fraction=0.046, pad=0.04, label="相位 (rad)")
+
+            # 在三幅图上标记峰/谷值位置，并智能调整文字位置避免出界
+            def annotate_peaks(ax, stats, data, label_max="峰", label_min="谷"):
+                if stats is None:
+                    return
+                h, w = data.shape
+                (rmax, cmax) = stats["max_pos"]
+                (rmin, cmin) = stats["min_pos"]
+                vmax_local = stats["vmax"]
+                vmin_local = stats["vmin"]
+
+                offset_x = max(w * 0.02, 5)
+                offset_y = max(h * 0.02, 5)
+
+                # 峰值标注位置
+                if cmax > w * 0.7:
+                    x_text_max = cmax - offset_x
+                    ha_max = "right"
+                else:
+                    x_text_max = cmax + offset_x
+                    ha_max = "left"
+                if rmax > h * 0.8:
+                    y_text_max = rmax - offset_y
+                    va_max = "top"
+                else:
+                    y_text_max = rmax + offset_y
+                    va_max = "bottom"
+                x_text_max = min(max(x_text_max, 0), w - 1)
+                y_text_max = min(max(y_text_max, 0), h - 1)
+
+                # 谷值标注位置
+                if cmin > w * 0.7:
+                    x_text_min = cmin - offset_x
+                    ha_min = "right"
+                else:
+                    x_text_min = cmin + offset_x
+                    ha_min = "left"
+                if rmin > h * 0.8:
+                    y_text_min = rmin - offset_y
+                    va_min = "top"
+                else:
+                    y_text_min = rmin + offset_y
+                    va_min = "bottom"
+                x_text_min = min(max(x_text_min, 0), w - 1)
+                y_text_min = min(max(y_text_min, 0), h - 1)
+
+                # 峰值：圆圈
+                ax.scatter([cmax], [rmax], marker="o", s=60, edgecolors="k", facecolors="none")
+                ax.text(
+                    x_text_max,
+                    y_text_max,
+                    f"{label_max}:{vmax_local:.3f}",
+                    fontsize=self.scaled_font_size,
+                    color="black",
+                    ha=ha_max,
+                    va=va_max,
+                )
+
+                # 谷值：叉号
+                ax.scatter([cmin], [rmin], marker="x", s=60, color="k")
+                ax.text(
+                    x_text_min,
+                    y_text_min,
+                    f"{label_min}:{vmin_local:.3f}",
+                    fontsize=self.scaled_font_size,
+                    color="black",
+                    ha=ha_min,
+                    va=va_min,
+                )
+
+            annotate_peaks(axes[0], m0, original)
+            annotate_peaks(axes[1], m1, background)
+            annotate_peaks(axes[2], m2, residual)
 
             for ax in axes.flat:
                 ax.axis("off")
@@ -511,6 +649,80 @@ class App:
             print("图表窗口已生成。")
         except Exception as e:
             print(f"生成图表时发生错误: {e}")
+
+    # ---------------------------
+    #  Zernike 系数表（独立弹窗 + 文件保存）
+    # ---------------------------
+    def show_zernike_table_window(self, plot_data):
+        coeffs = plot_data.get("coeffs")
+        if coeffs is None:
+            print("警告: 未找到 Zernike 系数，无法显示系数表。")
+            return
+
+        n_terms_fit = int(plot_data.get("n_terms_fit", len(coeffs)))
+        output_dir = plot_data.get("output_dir", "")
+
+        win = tk.Toplevel(self.root)
+        win.title("Zernike 系数表")
+        win.geometry("900x500")
+
+        columns = ("k", "j", "n", "m", "name", "coeff")
+        tree = ttk.Treeview(win, style="Coeff.Treeview", columns=columns, show="headings")
+        tree.heading("k", text="内部序号 k")
+        tree.heading("j", text="Noll j")
+        tree.heading("n", text="n")
+        tree.heading("m", text="m")
+        tree.heading("name", text="名称")
+        tree.heading("coeff", text="系数 (rad)")
+
+        tree.column("k", width=100, anchor="center", stretch=False)
+        tree.column("j", width=80, anchor="center", stretch=False)
+        tree.column("n", width=60, anchor="center", stretch=False)
+        tree.column("m", width=60, anchor="center", stretch=False)
+        tree.column("name", width=220, anchor="w", stretch=True)
+        tree.column("coeff", width=260, anchor="e", stretch=True)
+
+        # 滚动条
+        scrollbar = ttk.Scrollbar(win, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        n_rows = min(n_terms_fit, len(coeffs))
+        for k in range(1, n_rows + 1):
+            j = self.analysis_core.internal_index_to_noll(k)
+            n, m = self.analysis_core.noll_to_nm(j)
+            name = self.term_name_map.get(k, "")
+            coeff_val = float(coeffs[k - 1])
+            tree.insert(
+                "",
+                "end",
+                values=(k, j, n, m, name, f"{coeff_val:.6e}"),
+            )
+
+        # 同时保存到文件
+        self.save_zernike_coeffs_to_file(coeffs, n_rows, output_dir)
+
+    def save_zernike_coeffs_to_file(self, coeffs, n_terms, output_dir):
+        if not output_dir:
+            if getattr(sys, "frozen", False):
+                output_dir = os.path.dirname(sys.executable)
+            else:
+                output_dir = os.path.dirname(os.path.abspath(__file__))
+
+        path = os.path.join(output_dir, "zernike_coeffs.txt")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("# k_internal\tNoll_j\tn\tm\tname\tcoeff(rad)\n")
+                for k in range(1, n_terms + 1):
+                    j = self.analysis_core.internal_index_to_noll(k)
+                    n, m = self.analysis_core.noll_to_nm(j)
+                    name = self.term_name_map.get(k, "")
+                    coeff_val = float(coeffs[k - 1])
+                    f.write(f"{k}\t{j}\t{n}\t{m}\t{name}\t{coeff_val:.10e}\n")
+            print(f"  - Zernike 系数已保存至: {path}")
+        except Exception as e:
+            print(f"  - 错误: 保存 Zernike 系数文件失败。 {e}")
 
     # ---------------------------
     #  日志输出重定向
