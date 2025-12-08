@@ -62,13 +62,7 @@ class ZernikeAnalysisCore:
 
     @staticmethod
     def internal_index_to_noll(k: int) -> int:
-        """软件内部第 k 项 -> 对应的 Noll 索引 j。
-
-        为了让第 4 项为 defocus，这里交换了 Noll j=4 和 j=5 的顺序：
-          k=4 -> j=5 (defocus)
-          k=5 -> j=4 (astig 45)
-        其它项保持 j=k。
-        """
+        """软件内部第 k 项 -> 对应的 Noll 索引 j。"""
         if k < 1:
             raise ValueError("内部索引 k 必须 >= 1")
         if k == 4:
@@ -120,41 +114,36 @@ class ZernikeAnalysisCore:
         try:
             print(f"正在加载相位文件: {phase_file} ...")
             phase_original = np.genfromtxt(phase_file)
-            # 将等于 100000.0 的值视作无效点，并替换为 NaN
-            phase_original[phase_original == 100000.0] = np.nan
-            print("  - 加载成功, 并将 100000.0 转换回 NaN。")
+            # 输入文件无效区域已经是 NaN，不做任何替换
+            print("  - 加载成功。")
         except OSError:
             print(f"错误: 文件 '{phase_file}' 未找到。")
             return None
 
         # --- 2. 坐标归一化 ---
         print("正在准备坐标并进行归一化...")
-        valid_mask = ~np.isnan(phase_original)
-        if not np.any(valid_mask):
+        # 第一层有效掩膜：非 NaN
+        base_valid_mask = ~np.isnan(phase_original)
+        if not np.any(base_valid_mask):
             print("错误: 数据文件中没有有效数据点。")
             return None
 
         height, width = phase_original.shape
-        rows, cols = np.where(valid_mask)
-        center_x = (cols.min() + cols.max()) / 2.0
-        center_y = (rows.min() + rows.max()) / 2.0
-        radius = max(
-            (cols.max() - center_x),
-            (rows.max() - center_y),
-            (center_x - cols.min()),
-            (center_y - rows.min()),
-        )
+        rows0, cols0 = np.where(base_valid_mask)
+        center_x = (cols0.min() + cols0.max()) / 2.0
+        center_y = (rows0.min() + rows0.max()) / 2.0
+        # 使用到最远有效点的距离作为半径，保证所有有效点的 rho<=1
+        radius = np.sqrt((cols0 - center_x) ** 2 + (rows0 - center_y) ** 2).max()
         print(f"  - 检测到有效数据区域: 中心 ({center_x:.1f}, {center_y:.1f}), 半径 {radius:.1f}")
 
         y, x = np.indices((height, width))
         rho = np.sqrt((x - center_x) ** 2 + (y - center_y) ** 2) / radius
         theta = np.arctan2(y - center_y, x - center_x)
 
-        # 只在单位圆内进行拟合，保证与 Zernike 正交域一致
-        aperture_mask = rho <= 1.0
-        valid_mask = valid_mask & aperture_mask
+        # 不再按圆孔裁切，直接使用输入中的有效掩膜
+        valid_mask = base_valid_mask
 
-        print("  - 坐标归一化完成，并限制在单位圆内。")
+        print("  - 坐标归一化完成，直接使用有效掩膜（不进行圆形裁剪）。")
 
         # --- 3. 泽尼克多项式拟合 ---
         print(f"正在构建按内部顺序的前 {n_terms_fit} 项 Zernike 基底并进行拟合...")
@@ -203,7 +192,18 @@ class ZernikeAnalysisCore:
 
         print("  - 背景已重建并已从原图中减去。")
 
-        # --- 4.1 计算 PV / RMS 等统计量 ---
+        # --- 4.1 依据最终 valid_mask 裁剪到最小有效矩形 ---
+        rows_v, cols_v = np.where(valid_mask)
+        rmin, rmax = rows_v.min(), rows_v.max()
+        cmin, cmax = cols_v.min(), cols_v.max()
+        print(f"  - 将输出和显示裁剪到行 [{rmin}:{rmax}]，列 [{cmin}:{cmax}] 的有效区域。")
+
+        phase_original = phase_original[rmin:rmax + 1, cmin:cmax + 1]
+        phase_background = phase_background[rmin:rmax + 1, cmin:cmax + 1]
+        phase_residual = phase_residual[rmin:rmax + 1, cmin:cmax + 1]
+        valid_mask = valid_mask[rmin:rmax + 1, cmin:cmax + 1]
+
+        # --- 4.2 计算 PV / RMS 等统计量 ---
         def compute_stats(data: np.ndarray, mask: np.ndarray):
             masked = np.where(mask, data, np.nan)
             if not np.any(mask):
@@ -246,13 +246,9 @@ class ZernikeAnalysisCore:
                 output_dir = os.path.dirname(os.path.abspath(__file__))
             print(f"  - 未指定输出目录，将使用默认目录: {output_dir}")
 
-        # 准备背景数据：在无效位置写回 100000.0
+        # 直接保存裁剪后的数据；无效点保持 NaN
         background_to_save = phase_background.copy()
-        background_to_save[~valid_mask] = 100000.0
-
-        # 准备表面误差数据：NaN 改为 100000.0
         surface_to_save = phase_residual.copy()
-        surface_to_save[np.isnan(surface_to_save)] = 100000.0
 
         try:
             bg_path = os.path.join(output_dir, "background.txt")
@@ -499,6 +495,7 @@ class App:
 
             selected_terms = plot_data.get("selected_terms", [])
             metrics = plot_data.get("metrics", {}) or {}
+            valid_mask = plot_data.get("valid_mask", None)
 
             fig = Figure(figsize=(18, 6), dpi=100)
             if selected_terms:
@@ -514,11 +511,22 @@ class App:
             background = plot_data["background"]
             residual = plot_data["residual"]
 
-            vmax = np.nanmax(original)
-            vmin = np.nanmin(original)
+            # 使用 valid_mask 对绘图数据做掩膜，圆外无效点设为 NaN
+            if valid_mask is not None:
+                original_plot = np.where(valid_mask, original, np.nan)
+                background_plot = np.where(valid_mask, background, np.nan)
+                residual_plot = np.where(valid_mask, residual, np.nan)
+            else:
+                original_plot = original
+                background_plot = background
+                residual_plot = residual
+
+            # 颜色范围只按有效区域统计
+            vmax = np.nanmax(original_plot)
+            vmin = np.nanmin(original_plot)
 
             # 原始相位
-            im1 = axes[0].imshow(original, cmap="viridis", vmin=vmin, vmax=vmax)
+            im1 = axes[0].imshow(original_plot, cmap="viridis", vmin=vmin, vmax=vmax)
             m0 = metrics.get("original")
             if m0 is not None:
                 title0 = f"原始展开相位 (RMS = {m0['rms']:.4f} rad)"
@@ -528,7 +536,7 @@ class App:
             fig.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04, label="相位 (rad)")
 
             # 拟合背景
-            im2 = axes[1].imshow(background, cmap="viridis", vmin=vmin, vmax=vmax)
+            im2 = axes[1].imshow(background_plot, cmap="viridis", vmin=vmin, vmax=vmax)
             m1 = metrics.get("background")
             if m1 is not None:
                 if selected_terms:
@@ -544,10 +552,11 @@ class App:
             fig.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04, label="相位 (rad)")
 
             # 残差
-            res_vmax = np.nanmax(np.abs(residual))
+            res_vmax = np.nanmax(np.abs(residual_plot))
+            # 使用 jet colormap 模拟 MATLAB 默认风格 (红=高, 蓝=低)
             im3 = axes[2].imshow(
-                residual,
-                cmap="coolwarm",
+                residual_plot,
+                cmap="jet",
                 vmin=-res_vmax,
                 vmax=res_vmax,
             )
@@ -628,9 +637,9 @@ class App:
                     va=va_min,
                 )
 
-            annotate_peaks(axes[0], m0, original)
-            annotate_peaks(axes[1], m1, background)
-            annotate_peaks(axes[2], m2, residual)
+            annotate_peaks(axes[0], m0, original_plot)
+            annotate_peaks(axes[1], m1, background_plot)
+            annotate_peaks(axes[2], m2, residual_plot)
 
             for ax in axes.flat:
                 ax.axis("off")

@@ -26,7 +26,7 @@ plt.rcParams['font.sans-serif'] = ['SimHei']
 plt.rcParams['axes.unicode_minus'] = False
 
 # SciPy 滤波（中值 / 高斯）
-from scipy.ndimage import median_filter, gaussian_filter
+from scipy.ndimage import median_filter, gaussian_filter, label
 
 
 # =============================================================================
@@ -97,13 +97,16 @@ def opencv_nl_means_float(img,
     return denoised
 
 
-def opencv_unwrap_phase(wrapped_phase: np.ndarray) -> np.ndarray:
+def opencv_unwrap_phase(wrapped_phase: np.ndarray,
+                        valid_mask: np.ndarray = None) -> np.ndarray:
     """使用 OpenCV phase_unwrapping 模块进行二维相位展开。
 
     要求：
     - 已安装 opencv-contrib-python；
     - cv2 中存在子模块 cv2.phase_unwrapping；
     - 输入 wrapped_phase 为 2D 数组，值域在 [-pi, pi]（四步相移 arctan2 的典型输出）。
+    - valid_mask 为可选有效区域掩码，True/非零 表示该像素有相位信息，False/0 为无效像素。
+      无效像素会通过 shadowMask 从展开过程中屏蔽掉，避免产生伪条纹。
     """
     if not hasattr(cv2, "phase_unwrapping"):
         raise RuntimeError(
@@ -115,12 +118,9 @@ def opencv_unwrap_phase(wrapped_phase: np.ndarray) -> np.ndarray:
     if wp.ndim != 2:
         raise ValueError(f"wrapped_phase 必须是 2D 数组，当前维度: {wp.ndim}")
 
-    # OpenCV 文档定义：给定包裹在 [-pi, pi] 的相位图，进行展开
-    # 这里不再人为映射到 [0, 2*pi)，直接使用原始 [-pi, pi] 输出即可。
     h, w = wp.shape
 
     # 构造参数对象（优先使用模块形式的 API）
-    params = None
     if hasattr(cv2.phase_unwrapping, "HistogramPhaseUnwrapping_Params"):
         params = cv2.phase_unwrapping.HistogramPhaseUnwrapping_Params()
     elif hasattr(cv2, "phase_unwrapping_HistogramPhaseUnwrapping_Params"):
@@ -147,10 +147,21 @@ def opencv_unwrap_phase(wrapped_phase: np.ndarray) -> np.ndarray:
             "当前 OpenCV 未暴露 HistogramPhaseUnwrapping.create / *_create 接口。"
         )
 
+    # 构造 shadowMask：CV_8UC1，非零 = 有效像素，0 = 无效像素
+    shadow_mask = None
+    if valid_mask is not None:
+        vm = np.asarray(valid_mask)
+        if vm.shape != wp.shape:
+            raise ValueError("valid_mask 形状必须与 wrapped_phase 一致")
+        shadow_mask = np.where(vm, 255, 0).astype(np.uint8)
+
     # Python 签名：
     #   cv.phase_unwrapping.PhaseUnwrapping.unwrapPhaseMap(wrappedPhaseMap[, unwrappedPhaseMap[, shadowMask]]) -> unwrappedPhaseMap
     try:
-        unwrapped = unwrapper.unwrapPhaseMap(wp)
+        if shadow_mask is None:
+            unwrapped = unwrapper.unwrapPhaseMap(wp)
+        else:
+            unwrapped = unwrapper.unwrapPhaseMap(wp, None, shadow_mask)
     except Exception as e:
         raise RuntimeError(f"调用 unwrapPhaseMap 失败: {e}")
 
@@ -175,7 +186,8 @@ class AnalysisCore:
                 data = data.astype(np.float32, copy=False)
 
                 # 饱和掩码：值 > 1 视为无效
-                current_saturation_mask = data > 1
+                nan_mask = np.isnan(data)
+                current_saturation_mask = nan_mask
                 # 这些点强度置 0
                 data[current_saturation_mask] = 0
 
@@ -193,6 +205,20 @@ class AnalysisCore:
         final_mask = saturation_mask
         print(f"  - 最终无效点 (仅基于饱和): {np.sum(final_mask)} 个。")
         return interferograms, final_mask
+
+    @staticmethod
+    def keep_largest_valid_region(valid_mask: np.ndarray) -> np.ndarray:
+        """保留面积最大的有效连通域（8 连通），返回新的有效掩膜。"""
+        if valid_mask is None or not np.any(valid_mask):
+            return valid_mask
+        structure = np.ones((3, 3), dtype=int)
+        labeled, num = label(valid_mask, structure=structure)
+        if num <= 1:
+            return valid_mask
+        counts = np.bincount(labeled.ravel())
+        counts[0] = 0
+        largest_label = counts.argmax()
+        return labeled == largest_label
 
     def calculate_wrapped_phase(self, interferograms):
         """四步相移法的包裹相位计算，输出范围约为 [-pi, pi]。"""
@@ -213,6 +239,14 @@ class AnalysisCore:
             return None
         print(f"--- 步骤 1 (数据加载) 完成，耗时: {time.time() - step1_start_time:.4f} 秒 ---\n")
 
+        # 仅保留面积最大的有效连通域，其余标记为无效
+        largest_valid = self.keep_largest_valid_region(~invalid_mask)
+        if largest_valid is None or not np.any(largest_valid):
+            print("错误: 未找到有效的连通区域。")
+            return None
+        invalid_mask = ~largest_valid
+        print(f"  - 已保留面积最大的有效连通域，其他区域设为无效，总无效像素: {np.sum(invalid_mask)}")
+
         # --- 步骤 1-优化: 降噪 ---
         if filter_type != 'none':
             step_denoise_start = time.time()
@@ -222,7 +256,7 @@ class AnalysisCore:
                 'gaussian': '高斯滤波',
                 'nl_means': '非局部均值滤波 (OpenCV)',
             }
-            print(f"步骤 1-优化: 正在应用【{filter_map.get(filter_type, '未知滤波')}】降噪...")
+            print(f"步骤 1-优化: 正在应用降噪...")
 
             if filter_type == 'median':
                 denoised_interferograms = [
@@ -254,13 +288,22 @@ class AnalysisCore:
         else:
             print("步骤 1-优化: 跳过降噪步骤。\n")
 
+        # 最大连通域之外设为 NaN，后续统一作为无效区域
+        for idx, img in enumerate(interferograms):
+            img = img.astype(float, copy=False)
+            img[invalid_mask] = np.nan
+            interferograms[idx] = img
+
         # --- 步骤 2 & 3 & 4: 计算与后处理 ---
         print("步骤 2: 正在计算包裹相位...")
         wrapped_phase = self.calculate_wrapped_phase(interferograms)
 
         print("步骤 3: 正在使用 OpenCV phase_unwrapping 模块进行相位展开...")
         try:
-            unwrapped_phase = opencv_unwrap_phase(wrapped_phase)
+            # 有效掩码：True 表示像素有效，False 表示饱和/无效
+            valid_mask = ~invalid_mask
+            wrapped_for_unwrap = np.nan_to_num(wrapped_phase, nan=0.0)
+            unwrapped_phase = opencv_unwrap_phase(wrapped_for_unwrap, valid_mask=valid_mask)
         except Exception as e:
             print(f"使用 OpenCV 相位展开时发生错误: {e}")
             return None
@@ -286,11 +329,11 @@ class AnalysisCore:
         print(f"步骤 5: 正在保存最终相位数据至 '{output_filename}'...")
 
         phase_to_save = final_phase_for_plot.copy()
-        phase_to_save[np.isnan(phase_to_save)] = 100000.0
+        # phase_to_save[np.isnan(phase_to_save)] = 100000.0
 
         try:
             np.savetxt(output_filename, phase_to_save, fmt='%.6f')
-            print("  - 保存成功。无效区域已保存为 100000.000000。")
+            print("  - 保存成功。无效区域已保存为 nan。")
         except Exception as e:
             print(f"  - 保存失败: {e}")
 
@@ -481,23 +524,46 @@ class App:
         try:
             print("正在新窗口中生成图表...")
 
+            base_mask = plot_data.get("mask")
+            valid_mask = ~base_mask if base_mask is not None else None
+
+            if valid_mask is not None and np.any(valid_mask):
+                rows_v, cols_v = np.where(valid_mask)
+                rmin, rmax = rows_v.min(), rows_v.max()
+                cmin, cmax = cols_v.min(), cols_v.max()
+            else:
+                rmin = cmin = rmax = cmax = None
+
+            def crop_and_mask(arr, apply_mask=True):
+                if rmin is not None:
+                    arr = arr[rmin:rmax + 1, cmin:cmax + 1]
+                    vm = valid_mask[rmin:rmax + 1, cmin:cmax + 1] if valid_mask is not None else None
+                else:
+                    vm = valid_mask
+                if apply_mask and vm is not None:
+                    arr = np.where(vm, arr, np.nan)
+                return arr
+
             fig, axes = plt.subplots(2, 2, figsize=(10, 10))
             fig.suptitle('数据分析流程', fontsize=self.scaled_font_size + 6)
 
             font_props = {'fontsize': self.scaled_font_size + 4}
 
-            im0 = axes[0, 0].imshow(plot_data["interferogram"], cmap='gray')
+            im0 = axes[0, 0].imshow(crop_and_mask(plot_data["interferogram"]), cmap='gray')
             fig.colorbar(im0, ax=axes[0, 0], fraction=0.046, pad=0.04)
             axes[0, 0].set_title('(a) 干涉图之一 (已应用滤波)', **font_props)
 
-            im1 = axes[0, 1].imshow(plot_data["wrapped_phase"], cmap='twilight_shifted')
+            im1 = axes[0, 1].imshow(crop_and_mask(plot_data["wrapped_phase"]), cmap='twilight_shifted')
             fig.colorbar(im1, ax=axes[0, 1], fraction=0.046, pad=0.04)
             axes[0, 1].set_title('(b) 包裹相位', **font_props)
 
-            axes[1, 0].imshow(plot_data["mask"], cmap='gray')
+            axes[1, 0].imshow(
+                plot_data["mask"][rmin:rmax + 1, cmin:cmax + 1] if rmin is not None else plot_data["mask"],
+                cmap='gray'
+            )
             axes[1, 0].set_title('(c) 无效掩码 (仅饱和)', **font_props)
 
-            im3 = axes[1, 1].imshow(plot_data["final_phase"], cmap='viridis')
+            im3 = axes[1, 1].imshow(crop_and_mask(plot_data["final_phase"]), cmap='viridis')
             fig.colorbar(im3, ax=axes[1, 1], fraction=0.046, pad=0.04)
             axes[1, 1].set_title('(d) 最终展开相位', **font_props)
 
