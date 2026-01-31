@@ -105,7 +105,15 @@ class ZernikeAnalysisCore:
             m_abs = abs(m)
             return np.sqrt(2 * (n + 1)) * radial * np.cos(m_abs * theta)
 
-    def fit_and_remove_background(self, phase_file, output_dir, n_terms_fit, selected_terms):
+    def fit_and_remove_background(
+        self,
+        phase_file,
+        output_dir,
+        n_terms_fit,
+        selected_terms,
+        remove_outliers=False,
+        outlier_percent=0.0,
+    ):
         print("=" * 60)
         print("泽尼克背景去除脚本启动 (内部序号 + 标准 Noll 实现)")
         print("=" * 60)
@@ -191,6 +199,35 @@ class ZernikeAnalysisCore:
         phase_residual = phase_original - phase_background
 
         print("  - 背景已重建并已从原图中减去。")
+
+        # --- 4.1 可选：对残差进行极端值去除（先做背景去除，再剔除极端点） ---
+        if remove_outliers and outlier_percent > 0:
+            tail = outlier_percent / 2.0
+            data_for_quantile = phase_residual[valid_mask]
+            if data_for_quantile.size < 2:
+                print("  - 数据点过少，无法执行极端值去除。")
+            else:
+                low, high = np.nanpercentile(data_for_quantile, [tail, 100 - tail])
+                extreme_mask = (phase_residual < low) | (phase_residual > high)
+                new_valid_mask = valid_mask & (~extreme_mask)
+                removed = int(valid_mask.sum() - new_valid_mask.sum())
+                if removed > 0 and np.any(new_valid_mask):
+                    valid_mask = new_valid_mask
+                    phase_original = np.where(valid_mask, phase_original, np.nan)
+                    phase_background = np.where(valid_mask, phase_background, np.nan)
+                    phase_residual = np.where(valid_mask, phase_residual, np.nan)
+                    removed_ratio = removed / data_for_quantile.size * 100
+                    print(
+                        f"  - 去除极端值开启: 阈值 [{low:.4f}, {high:.4f}]，共排除 {removed} 个点（约 {removed_ratio:.2f}%）。"
+                    )
+                elif removed > 0 and not np.any(new_valid_mask):
+                    print("  - 警告: 去除极端值后无有效点，已保留原始掩膜。")
+                else:
+                    print(f"  - 去除极端值开启: 阈值 [{low:.4f}, {high:.4f}]，未检测到需要排除的点。")
+
+        if not np.any(valid_mask):
+            print("错误: 去除极端值后数据为空，请降低百分比或关闭此选项。")
+            return None
 
         # --- 4.1 依据最终 valid_mask 裁剪到最小有效矩形 ---
         rows_v, cols_v = np.where(valid_mask)
@@ -353,6 +390,21 @@ class App:
             width=8,
         ).pack(side=tk.LEFT)
 
+        # 极端值去除选项（先背景去除，再剔除残差极端点）
+        self.remove_outliers = tk.BooleanVar(value=False)
+        self.outlier_percent = tk.DoubleVar(value=0.1)
+        outlier_frame = ttk.Frame(param_run_frame)
+        outlier_frame.pack(side=tk.LEFT, padx=(15, 0))
+        ttk.Checkbutton(outlier_frame, variable=self.remove_outliers).pack(side=tk.LEFT, padx=(0, 3))
+        ttk.Label(outlier_frame, text="去除极端值").pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Entry(
+            outlier_frame,
+            textvariable=self.outlier_percent,
+            font=(self.font_family, self.scaled_font_size),
+            width=6,
+        ).pack(side=tk.LEFT)
+        ttk.Label(outlier_frame, text="%").pack(side=tk.LEFT, padx=(3, 0))
+
         spacer = ttk.Frame(param_run_frame)
         spacer.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
@@ -446,6 +498,18 @@ class App:
             print("错误: 请在总拟合项数输入框中输入有效的整数。")
             return
 
+        remove_outliers = self.remove_outliers.get()
+        outlier_percent = 0.0
+        if remove_outliers:
+            try:
+                outlier_percent = float(self.outlier_percent.get())
+            except tk.TclError:
+                print("错误: 请在去除极端值的百分比输入框中输入有效的数字。")
+                return
+            if outlier_percent <= 0 or outlier_percent >= 100:
+                print("错误: 去除极端值的百分比需在 0~100 之间。")
+                return
+
         # 读取勾选的 Zernike 项
         selected_terms = sorted([k for k, var in self.term_vars.items() if var.get()])
         if selected_terms:
@@ -464,14 +528,19 @@ class App:
         # 启动后台线程进行计算
         threading.Thread(
             target=self.run_analysis_thread,
-            args=(input_file, output_dir, n_fit, selected_terms),
+            args=(input_file, output_dir, n_fit, selected_terms, remove_outliers, outlier_percent),
             daemon=True,
         ).start()
 
-    def run_analysis_thread(self, input_file, output_dir, n_fit, selected_terms):
+    def run_analysis_thread(self, input_file, output_dir, n_fit, selected_terms, remove_outliers, outlier_percent):
         try:
             results = self.analysis_core.fit_and_remove_background(
-                input_file, output_dir, n_terms_fit=n_fit, selected_terms=selected_terms
+                input_file,
+                output_dir,
+                n_terms_fit=n_fit,
+                selected_terms=selected_terms,
+                remove_outliers=remove_outliers,
+                outlier_percent=outlier_percent,
             )
             if results:
                 # 在主线程中更新 UI：显示图和系数表
